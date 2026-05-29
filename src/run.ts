@@ -19,6 +19,9 @@ import {
 } from "./edgar/monitors.js";
 import type { LeadSignal, MonitorKind } from "./edgar/types.js";
 
+/** Upsert rows in chunks so request bodies stay small. */
+const UPSERT_CHUNK_SIZE = 50;
+
 /** lead_engine_runs.run_type vocabulary. */
 type RunType = "reg_a" | "s1" | "8k";
 
@@ -182,39 +185,45 @@ async function runMonitor(def: MonitorDef): Promise<MonitorSummary> {
     summary.leadsFound = qualifying.length;
 
     if (qualifying.length > 0) {
-      const accs = qualifying.map((q) => q.signal.accessionNumber);
-
-      // Which of these already exist? (duplicates)
-      const { data: existing, error: existErr } = await supabase
-        .from("edgar_leads")
-        .select("accession_number")
-        .in("accession_number", accs);
-      if (existErr) throw new Error(`duplicate-check failed: ${existErr.message}`);
-
-      const existingSet = new Set(
-        (existing ?? []).map((r: { accession_number: string }) => r.accession_number)
-      );
-      summary.leadsDuplicate = accs.filter((a) => existingSet.has(a)).length;
-      summary.leadsNew = qualifying.length - summary.leadsDuplicate;
-
-      // Upsert all qualifying rows; conflict on accession_number.
-      const rows = qualifying.map(buildInsertRow);
-      const { data: upserted, error: upsertErr } = await supabase
-        .from("edgar_leads")
-        .upsert(rows, { onConflict: "accession_number" })
-        .select("id, accession_number, contact_email, contact_phone");
-      if (upsertErr) throw new Error(`upsert failed: ${upsertErr.message}`);
-
-      // Enrich only the NEW leads.
-      const byAccession = new Map<string, UpsertedRow>();
-      for (const r of (upserted ?? []) as UpsertedRow[]) {
-        byAccession.set(r.accession_number, r);
-      }
+      // Dedupe at the DB level: upsert on accession_number (unique) with
+      // ignoreDuplicates, so the DB decides new-vs-duplicate. No pre-check
+      // SELECT. Chunk the upsert so request bodies stay small.
+      const byAccessionQ = new Map<string, ScoredLead>();
       for (const q of qualifying) {
-        const acc = q.signal.accessionNumber;
-        if (existingSet.has(acc)) continue; // already existed -> skip enrichment
-        const row = byAccession.get(acc);
-        if (row) await enrichAndUpdate(q, row);
+        byAccessionQ.set(q.signal.accessionNumber, q);
+      }
+
+      const rows = qualifying.map(buildInsertRow);
+      const insertedRows: UpsertedRow[] = [];
+
+      for (let i = 0; i < rows.length; i += UPSERT_CHUNK_SIZE) {
+        const chunk = rows.slice(i, i + UPSERT_CHUNK_SIZE);
+        const { data: upserted, error: upsertErr } = await supabase
+          .from("edgar_leads")
+          .upsert(chunk, {
+            onConflict: "accession_number",
+            ignoreDuplicates: true,
+          })
+          .select("id, accession_number, contact_email, contact_phone");
+        if (upsertErr) {
+          throw new Error(
+            `upsert failed (chunk ${i / UPSERT_CHUNK_SIZE}): ${upsertErr.message}`
+          );
+        }
+        // With ignoreDuplicates, only NEWLY inserted rows are returned.
+        for (const r of (upserted ?? []) as UpsertedRow[]) {
+          insertedRows.push(r);
+        }
+      }
+
+      // leadsNew = rows the upsert actually INSERTED (summed across chunks).
+      summary.leadsNew = insertedRows.length;
+      summary.leadsDuplicate = qualifying.length - summary.leadsNew;
+
+      // Enrich only the NEW (just-inserted) leads.
+      for (const row of insertedRows) {
+        const q = byAccessionQ.get(row.accession_number);
+        if (q) await enrichAndUpdate(q, row);
       }
     }
   } catch (err) {
