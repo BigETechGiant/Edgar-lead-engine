@@ -1,0 +1,29 @@
+{
+  "name": "edgar-lead-engine",
+  "version": "1.0.0",
+  "description": "Monitors SEC EDGAR for investment-banking lead signals, scores and enriches them, writes to Supabase, and emails a daily digest.",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
+    "@supabase/supabase-js": "^2.48.1",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^20.17.16",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
