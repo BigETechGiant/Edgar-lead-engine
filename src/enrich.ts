@@ -1,14 +1,18 @@
 /**
  * Light Claude enrichment layer.
  *
- * For each qualifying lead, Claude researches the company with the server-side
- * web_search tool and returns intel used to fill these edgar_leads columns:
+ * For each qualifying lead, Claude researches the company and returns intel
+ * used to fill these edgar_leads columns:
  *   company_description, intelligence_summary, outreach_angle,
- *   contact_name, contact_title, website, linkedin_url, enrichment_payload,
+ *   contact_name, contact_title, website, enrichment_payload,
  *   enrichment_status.
  *
- * We never overwrite contact_email / contact_phone that already hold a value
- * (FullEnrich owns those); run.ts only fills them when currently null.
+ * FullEnrich (via the Solventis Prospector dashboard) owns contact_email,
+ * contact_phone, and LinkedIn discovery now — Claude no longer looks these up.
+ *
+ * The server-side web_search tool is only attached for high-value leads
+ * (score >= WEB_SEARCH_MIN_SCORE); lower-scored leads are enriched from the
+ * filing signal alone, with no web search cost.
  *
  * enrichment_status vocabulary (enum):
  *   unenriched | pending | enriched | partial | not_found | error
@@ -16,6 +20,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "./config.js";
 import type { ScoredLead } from "./scoring.js";
+
+/** Below this lead_score, enrich from the filing signal alone (no web_search). */
+const WEB_SEARCH_MIN_SCORE = 75;
 
 export type EnrichmentStatus =
   | "unenriched"
@@ -33,10 +40,6 @@ export interface EnrichmentResult {
   contactName: string | null;
   contactTitle: string | null;
   website: string | null;
-  linkedinUrl: string | null;
-  /** Discovered contact details — only applied by run.ts if the row's value is null. */
-  discoveredEmail: string | null;
-  discoveredPhone: string | null;
   /** Raw model JSON, persisted to enrichment_payload. */
   payload: unknown;
 }
@@ -50,9 +53,6 @@ function blank(status: EnrichmentStatus, payload: unknown = null): EnrichmentRes
     contactName: null,
     contactTitle: null,
     website: null,
-    linkedinUrl: null,
-    discoveredEmail: null,
-    discoveredPhone: null,
     payload,
   };
 }
@@ -64,8 +64,9 @@ function getClient(): Anthropic {
 }
 
 const SYSTEM = `You are a research analyst for Solventis, a lower-middle-market investment bank.
-Given a company that just made an SEC filing, research it with web search and return a concise JSON profile to support outbound deal origination.
+Given a company that just made an SEC filing, research it and return a concise JSON profile to support outbound deal origination.
 Be accurate and conservative: if you cannot verify a fact, use null rather than guessing.
+Do not look up or guess a contact's email, phone number, or LinkedIn profile — that is handled by a separate enrichment step.
 Respond with ONLY a single JSON object (no markdown, no prose) of exactly this shape:
 {
   "found": boolean,                  // did you find a credible match for this company?
@@ -74,10 +75,7 @@ Respond with ONLY a single JSON object (no markdown, no prose) of exactly this s
   "outreach_angle": string|null,     // ONE sentence: why Solventis should reach out now
   "contact_name": string|null,       // likely owner / CEO / key decision-maker
   "contact_title": string|null,
-  "website": string|null,            // official company website URL
-  "linkedin_url": string|null,       // company LinkedIn URL
-  "phone": string|null,              // a business phone if clearly found, else null
-  "email": string|null               // a business contact email if clearly found, else null
+  "website": string|null             // official company website URL
 }`;
 
 const TRIGGER_BY_MONITOR: Record<string, string> = {
@@ -109,9 +107,6 @@ interface RawProfile {
   contact_name?: string | null;
   contact_title?: string | null;
   website?: string | null;
-  linkedin_url?: string | null;
-  phone?: string | null;
-  email?: string | null;
 }
 
 function collectText(content: Anthropic.Messages.ContentBlock[]): string {
@@ -142,13 +137,26 @@ export async function enrichLead(lead: ScoredLead): Promise<EnrichmentResult> {
       { role: "user", content: buildUserPrompt(lead) },
     ];
 
+    // web_search is expensive — only attach it for high-value leads. Lower-
+    // scored leads are enriched from the filing signal alone, at no search cost.
+    // Haiku 4.5 predates dynamic-filtering web_search (_20260209), so use the
+    // basic tool version.
+    const tools =
+      lead.score >= WEB_SEARCH_MIN_SCORE
+        ? [
+            {
+              type: "web_search_20250305" as const,
+              name: "web_search" as const,
+              max_uses: 2,
+            },
+          ]
+        : [];
+
     const params = {
-      model: "claude-opus-4-7",
-      max_tokens: 4000,
-      thinking: { type: "adaptive" as const },
-      output_config: { effort: "low" as const },
+      model: "claude-haiku-4-5",
+      max_tokens: 400,
       system: SYSTEM,
-      tools: [{ type: "web_search_20260209" as const, name: "web_search" as const }],
+      tools,
       messages,
     };
 
@@ -178,9 +186,6 @@ export async function enrichLead(lead: ScoredLead): Promise<EnrichmentResult> {
       contactName: raw.contact_name ?? null,
       contactTitle: raw.contact_title ?? null,
       website: raw.website ?? null,
-      linkedinUrl: raw.linkedin_url ?? null,
-      discoveredEmail: raw.email ?? null,
-      discoveredPhone: raw.phone ?? null,
       payload: raw,
     };
 
