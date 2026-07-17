@@ -46,6 +46,7 @@ export interface Config {
 
   minLeadScore: number;
   lookbackDays: number;
+  enrichmentMinScore: number;
 
   postalEndpoint: string;
   postalApiKey: string;
@@ -73,6 +74,10 @@ const cfg: Config = {
 
   minLeadScore: intEnv("MIN_LEAD_SCORE", 40),
   lookbackDays: intEnv("LOOKBACK_DAYS", 7),
+  // Only leads scoring >= this get sent to Claude for enrichment (separate
+  // from MIN_LEAD_SCORE, which gates persistence). Bounds Anthropic spend to
+  // the leads most likely to be worth an outbound call.
+  enrichmentMinScore: intEnv("ENRICHMENT_MIN_SCORE", 65),
 
   postalEndpoint: optional("POSTAL_ENDPOINT"),
   postalApiKey: optional("POSTAL_API_KEY"),

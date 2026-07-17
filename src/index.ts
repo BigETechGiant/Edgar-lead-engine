@@ -65,6 +65,7 @@ app.post("/trigger", async (req: Request, res: Response) => {
       monitors: s.monitors,
       startedAt: s.startedAt,
       completedAt: s.completedAt,
+      claudeCost: s.claudeCost,
     });
   } catch (err) {
     console.error("[trigger] run failed:", err);

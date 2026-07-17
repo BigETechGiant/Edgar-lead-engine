@@ -10,11 +10,16 @@
  * - Claude enrichment is capped at MAX_ENRICHMENTS_PER_RUN per scheduled run
  *   to bound API cost; leads beyond the cap are still inserted (so no leads
  *   are lost) but stay unenriched until manually reprocessed.
+ * - Only unenriched leads scoring >= config.enrichmentMinScore are sent to
+ *   Claude at all; enrichment happens in bounded-concurrency batches of
+ *   ENRICH_BATCH_SIZE via processInBatches, never one giant Promise.all.
  */
 import { supabase } from "./supabase.js";
 import { config } from "./config.js";
 import { scoreLead, type ScoredLead } from "./scoring.js";
 import { enrichLead } from "./enrich.js";
+import { processInBatches } from "./lib/batch.js";
+import { resetCostTracking, getCostSummary } from "./lib/claudeGuarded.js";
 import {
   regAMonitor,
   withdrawalMonitor,
@@ -27,6 +32,9 @@ const UPSERT_CHUNK_SIZE = 50;
 
 /** Hard cap on Claude enrichment calls across an entire scheduled run. */
 const MAX_ENRICHMENTS_PER_RUN = 20;
+
+/** Enrichment concurrency — at most this many callClaude() calls in flight at once. */
+const ENRICH_BATCH_SIZE = 25;
 
 /** lead_engine_runs.run_type vocabulary. */
 type RunType = "reg_a" | "s1" | "8k";
@@ -61,6 +69,14 @@ export interface RunSummary {
   leadsNew: number;
   leadsDuplicate: number;
   monitors: MonitorSummary[];
+  /** Resolved model + estimated Anthropic spend for this run's enrichment calls. */
+  claudeCost: {
+    model: string;
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCostUsd: number;
+  };
 }
 
 function dateOrNull(s: string): string | null {
@@ -223,10 +239,15 @@ async function runMonitor(
       summary.leadsNew = insertedRows.length;
       summary.leadsDuplicate = qualifying.length - summary.leadsNew;
 
-      // Enrich only the NEW (just-inserted) leads, capped by the run-wide
-      // enrichment budget. Highest-scored leads get priority under the cap;
-      // any leads left over stay inserted but unenriched.
-      const toEnrich = [...insertedRows].sort((a, b) => {
+      // Enrich only the NEW (just-inserted), still-unenriched leads scoring
+      // >= config.enrichmentMinScore, capped by the run-wide enrichment
+      // budget. Highest-scored leads get priority under the cap; any leads
+      // left over (below threshold or beyond the cap) stay inserted but
+      // unenriched.
+      const eligible = insertedRows.filter(
+        (r) => (byAccessionQ.get(r.accession_number)?.score ?? 0) >= config.enrichmentMinScore
+      );
+      const toEnrich = eligible.sort((a, b) => {
         const scoreA = byAccessionQ.get(a.accession_number)?.score ?? 0;
         const scoreB = byAccessionQ.get(b.accession_number)?.score ?? 0;
         return scoreB - scoreA;
@@ -234,19 +255,20 @@ async function runMonitor(
 
       if (toEnrich.length > budget.remaining) {
         console.warn(
-          `[run:${def.monitor}] enrichment cap hit: ${toEnrich.length} new leads, ` +
-            `only ${budget.remaining} of ${MAX_ENRICHMENTS_PER_RUN} run-wide slots left — ` +
+          `[run:${def.monitor}] enrichment cap hit: ${toEnrich.length} eligible new leads ` +
+            `(score >= ${config.enrichmentMinScore}), only ${budget.remaining} of ` +
+            `${MAX_ENRICHMENTS_PER_RUN} run-wide slots left — ` +
             `${toEnrich.length - budget.remaining} lead(s) inserted but left unenriched.`
         );
       }
 
-      for (const row of toEnrich) {
-        if (budget.remaining <= 0) break;
+      const capped = toEnrich.slice(0, budget.remaining);
+      await processInBatches(capped, ENRICH_BATCH_SIZE, async (row) => {
         const q = byAccessionQ.get(row.accession_number);
-        if (!q) continue;
+        if (!q) return;
         await enrichAndUpdate(q, row);
-        budget.remaining--;
-      }
+      });
+      budget.remaining -= capped.length;
     }
   } catch (err) {
     summary.error = (err as Error).message;
@@ -277,6 +299,11 @@ export async function runFullRun(): Promise<RunSummary> {
   const monitors: MonitorSummary[] = [];
   const budget: EnrichmentBudget = { remaining: MAX_ENRICHMENTS_PER_RUN };
 
+  // Every callClaude() call in this process accumulates into the same
+  // tracker (see lib/claudeGuarded.ts); reset it so this run's summary
+  // reflects only this run's enrichment spend.
+  resetCostTracking();
+
   for (const def of MONITORS) {
     monitors.push(await runMonitor(def, budget));
   }
@@ -292,10 +319,18 @@ export async function runFullRun(): Promise<RunSummary> {
     { filingsChecked: 0, leadsFound: 0, leadsNew: 0, leadsDuplicate: 0 }
   );
 
+  const cost = getCostSummary();
+  console.log(
+    `[run] claude model=${cost.model} calls=${cost.calls} ` +
+      `in_tokens=${cost.inputTokens} out_tokens=${cost.outputTokens} ` +
+      `est_cost_usd=$${cost.estimatedCostUsd.toFixed(4)}`
+  );
+
   return {
     startedAt,
     completedAt: new Date().toISOString(),
     ...agg,
     monitors,
+    claudeCost: cost,
   };
 }

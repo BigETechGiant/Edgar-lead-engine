@@ -8,21 +8,17 @@
  *   enrichment_status.
  *
  * FullEnrich (via the Solventis Prospector dashboard) owns contact_email,
- * contact_phone, and LinkedIn discovery now — Claude no longer looks these up.
- *
- * The server-side web_search tool is only attached for high-value leads
- * (score >= WEB_SEARCH_MIN_SCORE); lower-scored leads are enriched from the
- * filing signal alone, with no web search cost.
+ * contact_phone, and LinkedIn discovery now — Claude no longer looks these up,
+ * and no longer runs web_search: every call goes through the guarded
+ * lib/claudeGuarded.ts wrapper, which has no tools/web_search surface at all.
+ * Enrichment is filing-signal-only.
  *
  * enrichment_status vocabulary (enum):
  *   unenriched | pending | enriched | partial | not_found | error
  */
-import Anthropic from "@anthropic-ai/sdk";
 import { config } from "./config.js";
+import { callClaude, parseJsonResponse } from "./lib/claudeGuarded.js";
 import type { ScoredLead } from "./scoring.js";
-
-/** Below this lead_score, enrich from the filing signal alone (no web_search). */
-const WEB_SEARCH_MIN_SCORE = 75;
 
 export type EnrichmentStatus =
   | "unenriched"
@@ -55,12 +51,6 @@ function blank(status: EnrichmentStatus, payload: unknown = null): EnrichmentRes
     website: null,
     payload,
   };
-}
-
-let client: Anthropic | null = null;
-function getClient(): Anthropic {
-  if (!client) client = new Anthropic({ apiKey: config.anthropicApiKey });
-  return client;
 }
 
 const SYSTEM = `You are a research analyst for Solventis, a lower-middle-market investment bank.
@@ -109,68 +99,18 @@ interface RawProfile {
   website?: string | null;
 }
 
-function collectText(content: Anthropic.Messages.ContentBlock[]): string {
-  return content
-    .filter((b): b is Anthropic.Messages.TextBlock => b.type === "text")
-    .map((b) => b.text)
-    .join("\n");
-}
-
-function extractJson(text: string): RawProfile | null {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) return null;
-  try {
-    return JSON.parse(text.slice(start, end + 1)) as RawProfile;
-  } catch {
-    return null;
-  }
-}
-
 /** Enrich a single lead. Never throws — failures resolve to status "error". */
 export async function enrichLead(lead: ScoredLead): Promise<EnrichmentResult> {
   if (!config.enrichmentEnabled) return blank("unenriched");
 
   try {
-    const anthropic = getClient();
-    const messages: Anthropic.Messages.MessageParam[] = [
-      { role: "user", content: buildUserPrompt(lead) },
-    ];
-
-    // web_search is expensive — only attach it for high-value leads. Lower-
-    // scored leads are enriched from the filing signal alone, at no search cost.
-    // Haiku 4.5 predates dynamic-filtering web_search (_20260209), so use the
-    // basic tool version.
-    const tools =
-      lead.score >= WEB_SEARCH_MIN_SCORE
-        ? [
-            {
-              type: "web_search_20250305" as const,
-              name: "web_search" as const,
-              max_uses: 2,
-            },
-          ]
-        : [];
-
-    const params = {
-      model: "claude-haiku-4-5",
-      max_tokens: 400,
+    const { text } = await callClaude({
       system: SYSTEM,
-      tools,
-      messages,
-    };
+      prompt: buildUserPrompt(lead),
+      maxTokens: 400,
+    });
 
-    // Server-side web_search runs an internal loop; if it hits the iteration
-    // cap it returns stop_reason "pause_turn" and we re-send to resume.
-    let response = await anthropic.messages.create(params);
-    let guard = 0;
-    while (response.stop_reason === "pause_turn" && guard < 5) {
-      messages.push({ role: "assistant", content: response.content });
-      response = await anthropic.messages.create(params);
-      guard++;
-    }
-
-    const raw = extractJson(collectText(response.content));
+    const raw = parseJsonResponse<RawProfile>(text);
     if (!raw) {
       return blank("error", { parseError: true });
     }
